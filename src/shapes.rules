@@ -1,0 +1,297 @@
+# src/shapes.rules: the trees the matcher looks for in the parser's events
+# (docs/matcher.md). `mise run shapes` writes src/shapes.h and
+# src/shapes_table.h from it; `mise run test` fails when they are stale.
+
+# ---------------------------------------------------------------------------
+# The event language: how each event of include/staticjs.h builds the tree.
+# Every sjs_event_kind is declared once; the generator checks the header.
+#
+#   leaf            a node of its own, with no children
+#   postfix N       a node of its own over the N nodes before it
+#   postfix count   postfix 1 when its count is 1, a leaf when it is 0
+#   open N CLOSE    a bracket: its children follow until CLOSE, and the N
+#                   nodes before it are its first children
+#   inner           a separator of the bracket it is in
+#   close           ends the bracket it is in
+#   item            its node is always a whole child of its bracket
+#
+# An event that carries the node id of the innermost open bracket belongs to
+# that bracket, whatever is declared here: a template's STRING pieces and an
+# else-if's second IF are separators.
+
+event NUMBER leaf value: number, operand: operand;
+event STRING leaf value: text, operand: operand;   # a template's pieces are the template's own events
+event TRUE leaf operand: operand;
+event FALSE leaf operand: operand;
+event NULL leaf operand: operand;
+event NAME leaf name: read;
+event TEMPLATE_BEGIN open 0 TEMPLATE_END;
+event TEMPLATE_END close parts: count;
+event ARRAY_BEGIN open 0 ARRAY_END;
+event ELEMENT inner;
+event SPREAD_ELEMENT inner;
+event ARRAY_END close;
+event OBJECT_BEGIN open 0 OBJECT_END;
+event KEY inner key: text;
+event COMPUTED_KEY inner;
+event PROPERTY inner;
+event SPREAD_PROPERTY inner;
+event OBJECT_END close;
+event MEMBER postfix 1 key: text;
+event INDEX postfix 2;
+event OPTIONAL postfix 1 depth: count;
+event CHAIN_END postfix 1 depth: count;
+event CALL_BEGIN open 1 CALL_END;       # the callee is its first child
+event ARGUMENT inner;
+event SPREAD_ARGUMENT inner;
+event CALL_END close arguments: count;
+event NEW_BEGIN open 0 NEW_END constructor: text;
+event NEW_END close arguments: count;
+event UNARY postfix 1 op: operator;
+event BINARY postfix 2 op: operator;
+event LOGICAL open 1 LOGICAL_END op: operator;
+event LOGICAL_END close op: operator;
+event CONDITIONAL open 1 CONDITIONAL_END;
+event CONDITIONAL_ELSE inner;
+event CONDITIONAL_END close;
+event ARROW_BEGIN open 0 ARROW_END params: count;
+event PARAM inner index: count;
+event REST_PARAM inner index: count;
+event PARAMS_END inner;
+event BLOCK_BEGIN inner;                # a block body's statements are the arrow's children
+event RETURN postfix count item;
+event BLOCK_END inner;
+event ARROW_END close;
+event BLOCK_STATEMENT_BEGIN open 0 BLOCK_STATEMENT_END item;
+event BLOCK_STATEMENT_END close;
+event IF open 1 IF_END item;            # the test is its first child; an else-if's IF is its own event
+event ELSE inner chain: count;
+event IF_END close;
+event EXPRESSION_STATEMENT postfix 1 item;  # MUTATION: a statement that changes a variable
+event ASSIGN open 1 ASSIGN_END item op: operator;   # MUTATION: the target is its first child, the value its second; op 0 for =
+event ASSIGN_END close;
+event UPDATE postfix 1 item;            # MUTATION: ++ or -- of its target
+event DELETE postfix 1 item;            # MUTATION: delete of its target
+event BIND leaf item name: name;
+event ARRAY_PATTERN_BEGIN open 0 ARRAY_PATTERN_END item;
+event PATTERN_INDEX inner index: count;
+event ARRAY_PATTERN_END close;
+event OBJECT_PATTERN_BEGIN open 0 OBJECT_PATTERN_END item;
+event PATTERN_KEY inner key: text;
+event PATTERN_COMPUTED_KEY inner;
+event PATTERN_REST inner index: count;
+event OBJECT_PATTERN_END close;
+event DEFAULT open 0 DEFAULT_END item;
+event DEFAULT_END close;
+event CONST_BEGIN open 0 CONST_END item;
+event CONST_END close;
+event EXPORT leaf item;
+event IMPORT leaf item module: text;
+event EXPORT_DEFAULT postfix 1 item;
+event EXPORT_NAME leaf item;
+event EXPORT_FROM leaf item module: text;
+event BIGINT leaf;                      # a BigInt literal: not an operand a shape compares with
+event REGEXP leaf;                      # a regular expression literal (docs/regex.md)
+event END close;                        # closes the program (node 0)
+
+# ---------------------------------------------------------------------------
+# Callback shapes. The compiler records a shape on the function it matched
+# (docs/matcher.md, section 6); map, toSorted, the predicate loops and
+# reduce run a tagged callback in C (sections 7 and 11).
+
+shape PLUCK(key: text);                              # x => x.key
+shape COMPARE_BY_KEY(key: text, descending: flag);   # (a, b) => a.key - b.key, or b.key - a.key
+shape COMPARE_NUMERIC(descending: flag);             # (a, b) => a - b, or b - a
+shape KEY_COMPARE(key: text, op: operator, value: operand);   # x => x.key OP c, or c OP x.key
+shape ELEMENT_COMPARE(op: operator, value: operand);          # x => x OP c, or c OP x
+shape SUM(element_first: flag);                      # (a, x) => a + x, or x + a
+shape SUM_KEY(key: text, element_first: flag);       # (a, x) => a + x.key, or x.key + a
+shape PUSH_KEY(key: text);                           # MUTATION: (a, x) => { a.push(x.key); return a; }
+shape PUSH();                                        # MUTATION: (a, x) => { a.push(x); return a; }
+
+nonterminal key_of(object: read, key: text);         # object.key, the object a name
+nonterminal fixed(value: operand);       # a value fixed before the callback runs: here, a literal
+nonterminal key_test(object: read, key: text, op: operator, value: operand);
+nonterminal element_test(element: read, op: operator, value: operand);
+
+key_of(x, k) <- MEMBER{key: k}(NAME{name: x});
+
+# x => x.k, and x => { return x.k; }: x is parameter 0, the only one, a plain name.
+PLUCK(k) <- ARROW_BEGIN{params: 1}(PARAM{index: 0}, BIND{name: x}, PARAMS_END,
+                                   key_of(x, k));
+PLUCK(k) <- ARROW_BEGIN{params: 1}(PARAM{index: 0}, BIND{name: x}, PARAMS_END,
+                                   BLOCK_BEGIN, RETURN(key_of(x, k)), BLOCK_END);
+
+# (a, b) => a.k - b.k ascending; (a, b) => b.k - a.k descending. One key, both sides.
+COMPARE_BY_KEY(k, false) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a},
+                                                   PARAM{index: 1}, BIND{name: b}, PARAMS_END,
+                                                   BINARY{op: SUBTRACT}(key_of(a, k), key_of(b, k)));
+COMPARE_BY_KEY(k, true) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a},
+                                                  PARAM{index: 1}, BIND{name: b}, PARAMS_END,
+                                                  BINARY{op: SUBTRACT}(key_of(b, k), key_of(a, k)));
+COMPARE_BY_KEY(k, false) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a},
+                                                   PARAM{index: 1}, BIND{name: b}, PARAMS_END,
+                                                   BLOCK_BEGIN, RETURN(BINARY{op: SUBTRACT}(key_of(a, k), key_of(b, k))), BLOCK_END);
+COMPARE_BY_KEY(k, true) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a},
+                                                  PARAM{index: 1}, BIND{name: b}, PARAMS_END,
+                                                  BLOCK_BEGIN, RETURN(BINARY{op: SUBTRACT}(key_of(b, k), key_of(a, k))), BLOCK_END);
+
+# (a, b) => a - b ascending; (a, b) => b - a descending. Both names are the parameters.
+COMPARE_NUMERIC(false) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a},
+                                                 PARAM{index: 1}, BIND{name: b}, PARAMS_END,
+                                                 BINARY{op: SUBTRACT}(NAME{name: a}, NAME{name: b}));
+COMPARE_NUMERIC(true) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a},
+                                                PARAM{index: 1}, BIND{name: b}, PARAMS_END,
+                                                BINARY{op: SUBTRACT}(NAME{name: b}, NAME{name: a}));
+COMPARE_NUMERIC(false) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a},
+                                                 PARAM{index: 1}, BIND{name: b}, PARAMS_END,
+                                                 BLOCK_BEGIN, RETURN(BINARY{op: SUBTRACT}(NAME{name: a}, NAME{name: b})), BLOCK_END);
+COMPARE_NUMERIC(true) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a},
+                                                PARAM{index: 1}, BIND{name: b}, PARAMS_END,
+                                                BLOCK_BEGIN, RETURN(BINARY{op: SUBTRACT}(NAME{name: b}, NAME{name: a})), BLOCK_END);
+
+# A literal: a number, a string, true, false or null. A template's pieces
+# are its separators, and -1, NaN and undefined are not literals.
+fixed(c) <- NUMBER{operand: c};
+fixed(c) <- STRING{operand: c};
+fixed(c) <- TRUE{operand: c};
+fixed(c) <- FALSE{operand: c};
+fixed(c) <- NULL{operand: c};
+
+# x.key OP c. One rule per operator: no other operator may match.
+key_test(x, k, STRICT_EQUAL, c)     <- BINARY{op: STRICT_EQUAL}(key_of(x, k), fixed(c));
+key_test(x, k, STRICT_NOT_EQUAL, c) <- BINARY{op: STRICT_NOT_EQUAL}(key_of(x, k), fixed(c));
+key_test(x, k, LESS, c)             <- BINARY{op: LESS}(key_of(x, k), fixed(c));
+key_test(x, k, LESS_EQUAL, c)       <- BINARY{op: LESS_EQUAL}(key_of(x, k), fixed(c));
+key_test(x, k, GREATER, c)          <- BINARY{op: GREATER}(key_of(x, k), fixed(c));
+key_test(x, k, GREATER_EQUAL, c)    <- BINARY{op: GREATER_EQUAL}(key_of(x, k), fixed(c));
+# c OP x.key, recorded as x.key OP' c: the operator mirrored (docs/matcher.md, 11.7.2).
+key_test(x, k, STRICT_EQUAL, c)     <- BINARY{op: STRICT_EQUAL}(fixed(c), key_of(x, k));
+key_test(x, k, STRICT_NOT_EQUAL, c) <- BINARY{op: STRICT_NOT_EQUAL}(fixed(c), key_of(x, k));
+key_test(x, k, GREATER, c)          <- BINARY{op: LESS}(fixed(c), key_of(x, k));
+key_test(x, k, GREATER_EQUAL, c)    <- BINARY{op: LESS_EQUAL}(fixed(c), key_of(x, k));
+key_test(x, k, LESS, c)             <- BINARY{op: GREATER}(fixed(c), key_of(x, k));
+key_test(x, k, LESS_EQUAL, c)       <- BINARY{op: GREATER_EQUAL}(fixed(c), key_of(x, k));
+
+# x OP c, and c OP x mirrored.
+element_test(x, STRICT_EQUAL, c)     <- BINARY{op: STRICT_EQUAL}(NAME{name: x}, fixed(c));
+element_test(x, STRICT_NOT_EQUAL, c) <- BINARY{op: STRICT_NOT_EQUAL}(NAME{name: x}, fixed(c));
+element_test(x, LESS, c)             <- BINARY{op: LESS}(NAME{name: x}, fixed(c));
+element_test(x, LESS_EQUAL, c)       <- BINARY{op: LESS_EQUAL}(NAME{name: x}, fixed(c));
+element_test(x, GREATER, c)          <- BINARY{op: GREATER}(NAME{name: x}, fixed(c));
+element_test(x, GREATER_EQUAL, c)    <- BINARY{op: GREATER_EQUAL}(NAME{name: x}, fixed(c));
+element_test(x, STRICT_EQUAL, c)     <- BINARY{op: STRICT_EQUAL}(fixed(c), NAME{name: x});
+element_test(x, STRICT_NOT_EQUAL, c) <- BINARY{op: STRICT_NOT_EQUAL}(fixed(c), NAME{name: x});
+element_test(x, GREATER, c)          <- BINARY{op: LESS}(fixed(c), NAME{name: x});
+element_test(x, GREATER_EQUAL, c)    <- BINARY{op: LESS_EQUAL}(fixed(c), NAME{name: x});
+element_test(x, LESS, c)             <- BINARY{op: GREATER}(fixed(c), NAME{name: x});
+element_test(x, LESS_EQUAL, c)       <- BINARY{op: GREATER_EQUAL}(fixed(c), NAME{name: x});
+
+# x => x.k OP c, x => x OP c, and their block forms: x is parameter 0, the
+# only one, a plain name.
+KEY_COMPARE(k, o, c) <- ARROW_BEGIN{params: 1}(PARAM{index: 0}, BIND{name: x}, PARAMS_END,
+                                               key_test(x, k, o, c));
+KEY_COMPARE(k, o, c) <- ARROW_BEGIN{params: 1}(PARAM{index: 0}, BIND{name: x}, PARAMS_END,
+                                               BLOCK_BEGIN, RETURN(key_test(x, k, o, c)), BLOCK_END);
+ELEMENT_COMPARE(o, c) <- ARROW_BEGIN{params: 1}(PARAM{index: 0}, BIND{name: x}, PARAMS_END,
+                                                element_test(x, o, c));
+ELEMENT_COMPARE(o, c) <- ARROW_BEGIN{params: 1}(PARAM{index: 0}, BIND{name: x}, PARAMS_END,
+                                                BLOCK_BEGIN, RETURN(element_test(x, o, c)), BLOCK_END);
+
+# (a, x) => a + x, and x + a: the accumulator a is parameter 0 and the
+# element x parameter 1, by position; the flag says the element is the left
+# operand, so that C adds in the bytecode's order.
+SUM(false) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a}, PARAM{index: 1}, BIND{name: x}, PARAMS_END,
+                                     BINARY{op: ADD}(NAME{name: a}, NAME{name: x}));
+SUM(true) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a}, PARAM{index: 1}, BIND{name: x}, PARAMS_END,
+                                    BINARY{op: ADD}(NAME{name: x}, NAME{name: a}));
+SUM(false) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a}, PARAM{index: 1}, BIND{name: x}, PARAMS_END,
+                                     BLOCK_BEGIN, RETURN(BINARY{op: ADD}(NAME{name: a}, NAME{name: x})), BLOCK_END);
+SUM(true) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a}, PARAM{index: 1}, BIND{name: x}, PARAMS_END,
+                                    BLOCK_BEGIN, RETURN(BINARY{op: ADD}(NAME{name: x}, NAME{name: a})), BLOCK_END);
+
+# (a, x) => a + x.k, and x.k + a.
+SUM_KEY(k, false) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a}, PARAM{index: 1}, BIND{name: x}, PARAMS_END,
+                                            BINARY{op: ADD}(NAME{name: a}, key_of(x, k)));
+SUM_KEY(k, true) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a}, PARAM{index: 1}, BIND{name: x}, PARAMS_END,
+                                           BINARY{op: ADD}(key_of(x, k), NAME{name: a}));
+SUM_KEY(k, false) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a}, PARAM{index: 1}, BIND{name: x}, PARAMS_END,
+                                            BLOCK_BEGIN, RETURN(BINARY{op: ADD}(NAME{name: a}, key_of(x, k))), BLOCK_END);
+SUM_KEY(k, true) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a}, PARAM{index: 1}, BIND{name: x}, PARAMS_END,
+                                           BLOCK_BEGIN, RETURN(BINARY{op: ADD}(key_of(x, k), NAME{name: a})), BLOCK_END);
+
+# MUTATION: (a, x) => { a.push(x.k); return a; }, and a.push(x): reduce's accumulator
+# a, parameter 0, gets the element x, parameter 1, or its property. The
+# call takes its callee, the node before it, as its first child
+# (docs/matcher.md, 11.9.2); one argument, and no other statement.
+nonterminal push_of(receiver: read);                 # a.push, a a name
+
+push_of(a) <- MEMBER{key: "push"}(NAME{name: a});
+
+PUSH_KEY(k) <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a}, PARAM{index: 1}, BIND{name: x}, PARAMS_END,
+                                      BLOCK_BEGIN, EXPRESSION_STATEMENT(CALL_BEGIN(push_of(a), key_of(x, k), ARGUMENT)),
+                                      RETURN(NAME{name: a}), BLOCK_END);
+PUSH() <- ARROW_BEGIN{params: 2}(PARAM{index: 0}, BIND{name: a}, PARAM{index: 1}, BIND{name: x}, PARAMS_END,
+                                 BLOCK_BEGIN, EXPRESSION_STATEMENT(CALL_BEGIN(push_of(a), NAME{name: x}, ARGUMENT)),
+                                 RETURN(NAME{name: a}), BLOCK_END);
+
+# ---------------------------------------------------------------------------
+# MUTATION: rewrites (docs/matcher.md, section 12). Where a rewrite's rules
+# match, the compiler compiles the node differently: a rewrite is semantics,
+# not a tag, so these are matched with shapes on and off. Their rules are
+# anchored at a node's start, so the lane matches them in a dead region too:
+# a leaf, a postfix event over its first operand (`_` for the others), a
+# bracket over the node before it (`...` for its children), or a chain rule.
+# Their tests compare with constants, and they hand up nothing.
+
+# A mutating method called on a path from a name, ROOT(.k | [k])+ .m(...),
+# and a chain of them: the compiler rewrites it into a path to the container
+# the method changes in place (docs/mutation.md, "Methods through a path").
+rewrite MUTATE_PATH;
+
+nonterminal named();          # a name read
+nonterminal stepped();        # a name read, then one member or index or more
+nonterminal path();           # either
+nonterminal mutable();        # a path with a step, or a mutation through one that returns its receiver
+nonterminal mutating();       # a mutating method of a mutable
+nonterminal chaining();       # one that returns its receiver
+
+named() <- NAME;
+path() <- named();
+path() <- stepped();
+stepped() <- MEMBER(path());
+stepped() <- INDEX(path(), _);
+mutable() <- stepped();
+mutable() <- CALL_BEGIN(chaining(), ...);
+chaining() <- MEMBER{key: "sort"}(mutable());
+chaining() <- MEMBER{key: "reverse"}(mutable());
+chaining() <- MEMBER{key: "fill"}(mutable());
+chaining() <- MEMBER{key: "add"}(mutable());
+chaining() <- MEMBER{key: "set"}(mutable());
+mutating() <- chaining();
+mutating() <- MEMBER{key: "push"}(mutable());
+mutating() <- MEMBER{key: "pop"}(mutable());
+mutating() <- MEMBER{key: "shift"}(mutable());
+mutating() <- MEMBER{key: "unshift"}(mutable());
+mutating() <- MEMBER{key: "splice"}(mutable());
+mutating() <- MEMBER{key: "delete"}(mutable());
+mutating() <- MEMBER{key: "clear"}(mutable());
+MUTATE_PATH() <- CALL_BEGIN(mutating(), ...);
+
+# A string built on a let (docs/mutation.md, "Appending to a let"): s += e,
+# and s = s + e1 + e2 ..., + left-associated from a name. The compiler moves
+# the let's value out of its slot to the first +, which extends a string
+# nothing else holds in place (STRING_APPEND); the store puts it back.
+# APPEND is reported at the assignment's end, APPEND_SUM at each + of the
+# spine, whose outermost the compiler finds as the value of an assignment
+# to the same name. s = `${s}...`, a bracket over no node before it, is not
+# a form the lane anchors: the compiler finds it in its own code.
+rewrite APPEND;
+rewrite APPEND_SUM;
+
+nonterminal summed();         # a name read, then + of anything, once or more: s + e1 + e2
+
+APPEND() <- ASSIGN{op: ADD}(named(), ...);
+summed() <- BINARY{op: ADD}(named(), _);
+summed() <- BINARY{op: ADD}(summed(), _);
+APPEND_SUM() <- summed();

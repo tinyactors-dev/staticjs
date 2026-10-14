@@ -1,0 +1,29 @@
+#!/usr/bin/env ruby
+#MISE description="Test staticjs: the shapes tables, the amalgamation and the API description current, the shapes generator, three parameters at most, no recursion, freestanding for wasm32, the release's wasm module in Node, the tests under the sanitizers, every test program, and the spec against Node"
+#MISE sources=["include/**/*", "src/**/*", "tests/**/*", "bench/*.c", "bench/modules/**/*", "mise/**/*", "mise.toml", "../tinyxml/mise/lib/c_scan.rb", "../mise/lib/**/*", "../mise.toml"]
+#MISE outputs={auto=true}
+#MISE depends=["build"]
+#USAGE flag "--full" help="Also fail every allocation of every spec case"
+# vim:ft=ruby
+
+require_relative '../../staticjs'
+
+full = ENV['usage_full'] == 'true' || ARGV.include?('--full')
+StaticJS.run('mise', 'run', 'shapes', '--check')
+# The checked-in generated files: checked, never rewritten here (api's
+# dependency on amalgamate finds it current once the check has passed).
+StaticJS.run('mise', 'run', 'amalgamate', '--check')
+StaticJS.run('mise', 'run', 'api', '--check')
+StaticJS.run('mise', 'run', 'shapes-test')
+StaticJS.run('mise', 'run', 'check-parameters')
+StaticJS.run('mise', 'run', 'check-recursion')
+StaticJS.run('mise', 'run', 'check-freestanding')
+StaticJS.run('mise', 'run', 'wasm-test')
+StaticJS.run('mise', 'run', 'asan', *(full ? ['--full'] : []))
+
+failed = StaticJS::TESTS.reject do |test, spec|
+  system(StaticJS::BUILD.join(test).to_s, *spec.fetch(full ? :full : :fast), chdir: StaticJS::ROOT.to_s)
+end.keys
+abort "staticjs: failed: #{failed.join(', ')}" unless failed.empty?
+StaticJS.run('mise', 'run', 'diff-node')
+puts "staticjs: #{StaticJS.tests.size} test program(s) pass#{full ? ' (full)' : ''}"
